@@ -2,44 +2,21 @@ import json
 import os
 import time
 from kafka import KafkaConsumer, KafkaProducer
+
 from services.common.models import CanonicalGitHubEvent
+from services.enricher.models import enrich_event
 
 # ----------------------------
 # Configuration
 # ----------------------------
 
-RAW_TOPIC = "github_raw_events"
 CLEAN_TOPIC = "github_clean_events"
+ENRICHED_TOPIC = "github_enriched_events"
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 
 # ----------------------------
-# Transformer
+# Kafka Consumer setup (clean topic)
 # ----------------------------
-
-def transform_raw_event(raw: dict) -> CanonicalGitHubEvent:
-    return CanonicalGitHubEvent(
-        # Event
-        event_id=raw["id"],
-        event_type=raw["type"],
-        created_at=raw["created_at"],
-        is_public=raw["public"],
-
-        # Actor
-        actor_id=raw["actor"]["id"],
-        actor_login=raw["actor"]["login"],
-        actor_display_login=raw["actor"]["display_login"],
-
-        # Repo
-        repo_id=raw["repo"]["id"],
-        repo_name=raw["repo"]["name"],
-
-        # Org (optional)
-        org_id=raw.get("org", {}).get("id"),
-        org_login=raw.get("org", {}).get("login"),
-
-        # Payload
-        payload=raw["payload"]
-    )
 
 def wait_for_kafka(max_seconds: int = 90, sleep_seconds: int = 2) -> None:
     deadline = time.time() + max_seconds
@@ -60,13 +37,9 @@ def wait_for_kafka(max_seconds: int = 90, sleep_seconds: int = 2) -> None:
 
 wait_for_kafka()
 
-# ----------------------------
-# Kafka Consumer setup (raw topic)
-# ----------------------------
-
 consumer = KafkaConsumer(
-    RAW_TOPIC,
-    group_id="processor-v1",
+    CLEAN_TOPIC,
+    group_id="enricher-v1",
     bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
     value_deserializer=lambda v: json.loads(v.decode("utf-8")),
     auto_offset_reset="earliest",
@@ -74,7 +47,7 @@ consumer = KafkaConsumer(
 )
 
 # ----------------------------
-# Kafka Producer setup (clean topic)
+# Kafka Producer setup (enriched topic)
 # ----------------------------
 
 producer = KafkaProducer(
@@ -82,24 +55,36 @@ producer = KafkaProducer(
     value_serializer=lambda v: json.dumps(v).encode("utf-8"),
 )
 
-print("Processor started: listening on raw topic and producing clean events...")
+print("Enricher started: listening on clean topic and producing enriched events...")
 
 # ----------------------------
 # Main loop
 # ----------------------------
 
 for message in consumer:
-    raw_event = message.value
+    clean_dict = message.value
 
     try:
-        clean_event = transform_raw_event(raw_event)
-        clean_dict = clean_event.model_dump(mode="json")
+        # Validate clean event against schema
+        clean_event = CanonicalGitHubEvent.model_validate(clean_dict)
 
-        producer.send(CLEAN_TOPIC, value=clean_dict)
+        # Enrich event
+        enriched_event = enrich_event(clean_event)
+
+        # Serialize for Kafka
+        enriched_dict = enriched_event.model_dump(mode="json")
+
+        # Produce to Kafka
+        producer.send(ENRICHED_TOPIC, value=enriched_dict)
         producer.flush()
 
-        print(f"Produced clean event: {clean_dict['event_type']} | Repo: {clean_dict['repo_name']}")
+        print(
+            f"Produced enriched event: "
+            f"{enriched_dict['event_type']} | "
+            f"{enriched_dict['repo_name']} | "
+            f"{enriched_dict['activity_domain']}/{enriched_dict['activity_action']}"
+        )
 
     except Exception as e:
-        print("Invalid event skipped:")
+        print("Enrichment failed, event skipped:")
         print(e)
